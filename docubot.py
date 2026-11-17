@@ -9,6 +9,7 @@ Core DocuBot class responsible for:
 
 import os
 import glob
+import re
 
 class DocuBot:
     def __init__(self, docs_folder="docs", llm_client=None):
@@ -45,26 +46,96 @@ class DocuBot:
         return docs
 
     # -----------------------------------------------------------
+    # Text helpers
+    # -----------------------------------------------------------
+
+    # Common words that carry no meaning for search. Without this list,
+    # "Where is the ..." would match almost every section.
+    STOPWORDS = {
+        "a", "an", "the", "is", "are", "was", "be", "to", "of", "in", "on",
+        "for", "and", "or", "it", "this", "that", "these", "those", "there",
+        "do", "does", "i", "my", "we", "you", "what", "which", "where", "how",
+        "when", "who", "why", "any", "all", "with", "by", "from", "as", "at",
+        "can", "should", "if", "about", "me",
+    }
+
+    # A section must match at least this many distinct query keywords,
+    # otherwise DocuBot refuses instead of guessing (guardrail).
+    MIN_MATCHED_TERMS = 2
+
+    def stem(self, word):
+        """
+        Very light stemming so related word forms match:
+        "generated" / "generation" -> "generat", "users" -> "user",
+        "connection" -> "connect". Not linguistically perfect, just consistent.
+        """
+        for suffix in ("ing", "ion", "ed", "s"):
+            if word.endswith(suffix) and not word.endswith("ss") \
+                    and len(word) - len(suffix) >= 4:
+                word = word[: -len(suffix)]
+                break
+        if word.endswith("e") and len(word) > 4:
+            word = word[:-1]
+        return word
+
+    def tokenize(self, text):
+        """
+        Lowercase the text, split into words (underscores split too, so
+        "auth_utils" gives "auth" and "utils"), drop stopwords, and stem.
+        """
+        words = re.findall(r"[a-z0-9]+", text.lower())
+        return [self.stem(w) for w in words if w not in self.STOPWORDS]
+
+    def split_into_sections(self, text):
+        """
+        Split a markdown document into sections, starting a new section at
+        every heading line (#, ##, ###).
+
+        Each section is prefixed with the path of its parent headings, e.g.
+        "[Database Guide > Tables]" above "### users", so a small section
+        still says what it belongs to (and "table" can match it).
+        """
+        sections = []
+        heading_path = []   # list of (level, title) for the current position
+        current = []
+        breadcrumb = ""
+
+        def flush():
+            body = "\n".join(current).strip()
+            # Skip empty sections and headings with no text under them.
+            has_content = any(
+                l.strip() and not l.startswith("#") for l in current
+            )
+            if body and has_content:
+                sections.append(f"{breadcrumb}\n{body}" if breadcrumb else body)
+
+        for line in text.splitlines():
+            if line.startswith("#"):
+                flush()
+                current = []
+                level = len(line) - len(line.lstrip("#"))
+                title = line.lstrip("#").strip()
+                heading_path = [(l, t) for l, t in heading_path if l < level]
+                parents = [t for _, t in heading_path]
+                breadcrumb = f"[{' > '.join(parents)}]" if parents else ""
+                heading_path.append((level, title))
+            current.append(line)
+        flush()
+        return sections
+
+    # -----------------------------------------------------------
     # Index Construction (Phase 1)
     # -----------------------------------------------------------
 
     def build_index(self, documents):
         """
-        TODO (Phase 1):
         Build a tiny inverted index mapping lowercase words to the documents
-        they appear in.
-
-        Example structure:
-        {
-            "token": ["AUTH.md", "API_REFERENCE.md"],
-            "database": ["DATABASE.md"]
-        }
-
-        Keep this simple: split on whitespace, lowercase tokens,
-        ignore punctuation if needed.
+        they appear in, e.g. {"token": ["AUTH.md", "API_REFERENCE.md"]}.
         """
         index = {}
-        # TODO: implement simple indexing
+        for filename, text in documents:
+            for token in set(self.tokenize(text)):
+                index.setdefault(token, []).append(filename)
         return index
 
     # -----------------------------------------------------------
@@ -73,27 +144,55 @@ class DocuBot:
 
     def score_document(self, query, text):
         """
-        TODO (Phase 1):
-        Return a simple relevance score for how well the text matches the query.
-
-        Suggested baseline:
-        - Convert query into lowercase words
-        - Count how many appear in the text
-        - Return the count as the score
+        Relevance score = number of distinct query keywords that appear
+        in the text. Counting distinct words (not total occurrences) stops a
+        long section that repeats "token" ten times from beating a short
+        section that matches every word of the question.
         """
-        # TODO: implement scoring
-        return 0
+        query_terms = set(self.tokenize(query))
+        text_terms = set(self.tokenize(text))
+        return len(query_terms & text_terms)
 
     def retrieve(self, query, top_k=3):
         """
-        TODO (Phase 1):
-        Use the index and scoring function to select top_k relevant document snippets.
-
-        Return a list of (filename, text) sorted by score descending.
+        1. Use the index to find candidate documents containing any query word.
+        2. Split those documents into sections and score each section.
+        3. Drop sections below MIN_MATCHED_TERMS (the refusal guardrail).
+        4. Return the top_k (filename, section_text) pairs, best first.
         """
-        results = []
-        # TODO: implement retrieval logic
-        return results[:top_k]
+        query_terms = set(self.tokenize(query))
+        if not query_terms:
+            return []
+
+        candidate_files = set()
+        for term in query_terms:
+            candidate_files.update(self.index.get(term, []))
+
+        # Short queries (e.g. "database") can only match 1 term.
+        min_score = min(self.MIN_MATCHED_TERMS, len(query_terms))
+
+        scored = []
+        for filename, text in self.documents:
+            if filename not in candidate_files:
+                continue
+            for section in self.split_into_sections(text):
+                score = self.score_document(query, section)
+                if score >= min_score:
+                    heading = self.section_heading(section)
+                    heading_hits = self.score_document(query, heading)
+                    scored.append((score, heading_hits, filename, section))
+
+        # Highest score first. Ties go to the section whose own heading
+        # matches the query, then to the shorter (more focused) section.
+        scored.sort(key=lambda item: (-item[0], -item[1], len(item[3])))
+        return [(filename, section) for _, _, filename, section in scored[:top_k]]
+
+    def section_heading(self, section):
+        """Return the section's own heading line (skipping the breadcrumb)."""
+        for line in section.splitlines():
+            if line.startswith("#"):
+                return line
+        return ""
 
     # -----------------------------------------------------------
     # Answering Modes
